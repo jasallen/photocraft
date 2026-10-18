@@ -1573,8 +1573,8 @@ where
 /// 32-bit Lab is written with 16 bits). Extra samples follow the new sample type.
 fn lab_file(img: &Image) -> Image {
     let sample = if img.sample_type() == SampleType::U8 { SampleType::U8 } else { SampleType::U16 };
+    // `convert` brings the extra samples to the new sample type with the image.
     let mut file = img.convert(img.layout(), sample);
-    adapt_extras(&mut file, img.sample_type());
     let channels = file.layout().channels();
     convert_ab(file.data_mut(), channels, sample, true, true);
     file
@@ -1640,38 +1640,8 @@ fn estimated_size(img: &Image, tags: &TagSet<'_>) -> u64 {
 }
 
 pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
-    let cow = src.converted(plan.layout, plan.sample);
-    if cow.sample_type() != src.sample_type() {
-        let mut owned = cow.into_owned();
-        adapt_extras(&mut owned, src.sample_type());
-        return encode_ready(&owned, opts);
-    }
-    encode_ready(&cow, opts)
-}
-
-fn adapt_extras(img: &mut Image, from: SampleType) {
-    let to = img.sample_type();
-    if from == to {
-        return;
-    }
-    let n = img.width() as usize * img.height() as usize;
-    for e in &mut img.meta.extra_samples {
-        e.data = retarget_plane(&e.data, from, to, n);
-    }
-}
-
-fn retarget_plane(data: &[u8], from: SampleType, to: SampleType, n: usize) -> Vec<u8> {
-    let mut vals = Vec::with_capacity(n);
-    for i in 0..n {
-        let have = i.saturating_mul(from.bytes()).saturating_add(from.bytes()) <= data.len();
-        vals.push(if have { crate::image::read_normalized(data, from, i) } else { 0.0 });
-    }
-    match to {
-        SampleType::U8 => vals.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
-        SampleType::U16 => vals.iter().flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()).collect(),
-        SampleType::F16 => vals.iter().flat_map(|v| f16::from_f32(*v).to_bits().to_ne_bytes()).collect(),
-        SampleType::F32 => vals.iter().flat_map(|v| v.to_ne_bytes()).collect(),
-    }
+    // `converted` brings the extra samples to the plan's sample type with the image.
+    encode_ready(&src.converted(plan.layout, plan.sample), opts)
 }
 
 fn encode_ready(img: &Image, opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
