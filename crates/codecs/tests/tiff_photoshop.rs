@@ -179,6 +179,49 @@ fn sixteen_extra_samples_round_trip() {
     }
 }
 
+/// Extra samples count against `max_alloc` with the image (their interleaved buffer and the
+/// planes split from it): a budget that holds the RGB image but not sixteen extra planes refuses
+/// the file instead of allocating past it.
+#[test]
+fn extra_samples_count_against_the_allocation_limit() {
+    let (w, h) = (64u32, 64u32);
+    let n = (w * h) as usize;
+    let mut img = synth(w, h, ChannelLayout::Rgb, SampleType::U8, 1, 0.0);
+    img.meta.extra_samples = (0..MAX_EXTRA_SAMPLES).map(|k| ExtraSample { kind: 0, data: vec![k as u8; n] }).collect();
+    let bytes = encode(&img, Format::Tiff, &EncodeOptions::default()).unwrap();
+    let with = |max_alloc: u64| decode_with(&bytes, &DecodeOptions { limits: Limits { max_alloc, ..Limits::default() }, ..DecodeOptions::default() });
+    // RGB is 3 bytes a pixel; the extra samples add 2 x 16 more.
+    let image_only = 3 * n as u64;
+    let with_extras = (3 + 2 * MAX_EXTRA_SAMPLES as u64) * n as u64;
+    assert!(matches!(with(image_only), Err(CodecError::LimitExceeded(_))), "the image fits, the extra samples don't");
+    assert!(matches!(with(with_extras - 1), Err(CodecError::LimitExceeded(_))));
+    let back = with(with_extras).expect("everything fits");
+    assert_eq!(back.meta.extra_samples.len(), MAX_EXTRA_SAMPLES);
+}
+
+/// Converting an image's sample type converts its extra samples with it, so they keep matching
+/// the image: a 16-bit float TIFF's spot planes survive the 32-bit float a layered import uses.
+#[test]
+fn extra_samples_follow_a_sample_type_conversion() {
+    let (w, h) = (3u32, 2u32);
+    let n = (w * h) as usize;
+    let values = [0.0f32, 0.25, 0.5, 0.75, 1.0, 0.125];
+    let half = |v: f32| f16::from_f32(v).to_bits().to_ne_bytes();
+    let rgb: Vec<u8> = (0..n * 3).flat_map(|_| half(0.5)).collect();
+    let mut img = Image::from_raw(w, h, ChannelLayout::Rgb, SampleType::F16, rgb).unwrap();
+    img.meta.extra_samples = vec![ExtraSample { kind: 0, data: values.iter().flat_map(|v| half(*v)).collect() }];
+
+    let wide = img.convert(ChannelLayout::Rgb, SampleType::F32);
+    let plane: Vec<f32> = wide.meta.extra_samples[0].data.as_chunks::<4>().0.iter().map(|c| f32::from_ne_bytes(*c)).collect();
+    assert_eq!(plane, values);
+
+    // To 8 bits, the plane quantizes exactly as a gray image of the same values does.
+    let narrow = wide.convert(ChannelLayout::Rgb, SampleType::U8);
+    let gray = Image::from_raw(w, h, ChannelLayout::Gray, SampleType::F32, wide.meta.extra_samples[0].data.clone()).unwrap();
+    assert_eq!(narrow.meta.extra_samples[0].data, gray.convert(ChannelLayout::Gray, SampleType::U8).data());
+    assert_eq!(narrow.meta.extra_samples[0].data.len(), n);
+}
+
 #[test]
 fn absent_and_empty_tags_are_not_written() {
     let mut img = synth(4, 4, ChannelLayout::Rgb, SampleType::U8, 1, 0.0);

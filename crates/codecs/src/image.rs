@@ -658,6 +658,17 @@ impl Image {
             let values = convert_layout(&src, self.layout, layout);
             quantize(&values, sample)
         };
+        let mut meta = self.meta.clone();
+        if sample != self.sample {
+            // Extra samples are stored in the image's sample type, so they convert with it. A
+            // plane of the wrong size is left as it is: importers drop it with a warning.
+            let plane_len = (self.width as usize).saturating_mul(self.height as usize).saturating_mul(self.sample.bytes());
+            for e in meta.extra_samples.iter_mut().filter(|e| e.data.len() == plane_len) {
+                if let Ok(plane) = Image::from_raw(self.width, self.height, ChannelLayout::Gray, self.sample, std::mem::take(&mut e.data)) {
+                    e.data = plane.convert(ChannelLayout::Gray, sample).data;
+                }
+            }
+        }
         Image {
             width: self.width,
             height: self.height,
@@ -665,7 +676,7 @@ impl Image {
             sample,
             data,
             icc: if layout.same_model(self.layout) { self.icc.clone() } else { None },
-            meta: self.meta.clone(),
+            meta,
             warnings: self.warnings.clone(),
         }
     }

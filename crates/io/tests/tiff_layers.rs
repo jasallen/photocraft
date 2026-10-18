@@ -590,17 +590,12 @@ fn flat_tiff_warns_when_extra_channels_matte_transparency() {
     assert!(rgb[0] > 250 && (rgb[1] as i16 - 128).abs() <= 2 && (rgb[2] as i16 - 128).abs() <= 2, "{rgb:?}");
 }
 
-/// Photoshop 25.12 saves a layered TIFF that keeps transparency next to a spot channel as
-/// colour + transparency + spot samples, with a positive layer count, "Transparency" first in the
-/// channel names and an `MTrn` block (the specification's key is `Mtrn`). It opens with the spot
-/// as the only channel. A layered re-save leaves the transparency sample out next to the spot,
-/// so it must also drop the marker, or the spot would read back as transparency.
-#[test]
-fn photoshop_mtrn_tiff_opens_without_a_transparency_channel() {
+/// A 4×4 RGB document whose one layer is transparent outside its middle, plus a "White" spot
+/// channel with solid ink in its left half: the shape of a UV print's underbase.
+fn transparent_art_with_white_spot() -> Document {
     use photocraft_color::{Color, PixelFormat};
     use photocraft_doc::{AlphaChannel, Layer};
     use photocraft_geom::{Rect, Size};
-    use photocraft_psd::{Compression, TaggedBlock};
     use photocraft_raster::Surface;
 
     let mut doc = Document::new("t", Size::new(4, 4), ColorMode::Rgb, SampleType::U8);
@@ -610,17 +605,27 @@ fn photoshop_mtrn_tiff_opens_without_a_transparency_channel() {
     doc.layers.push(Layer::new("Layer 1", LayerContent::Raster(art)));
     let gray = PixelFormat::new(ColorMode::Grayscale, SampleType::U8, false);
     let mut plate = Surface::new(gray);
-    // Solid ink in the left half.
     plate.fill_rect(Rect::new(0, 0, 2, 4), &photocraft_raster::from_rgba(&gray, [1.0, 1.0, 1.0, 1.0]));
     let mut white = AlphaChannel::new("White", plate);
     white.spot = Some((Color::rgb(0.8, 0.2, 0.2), 1.0));
     doc.channels.push(white);
-    let ink = |d: &Document| (d.channels[0].surface.pixel(0, 0)[0], d.channels[0].surface.pixel(3, 0)[0]);
+    doc
+}
 
-    // Photoshop's layout, built from the PSD model of the same document: R, G, B, transparency
-    // and spot planes, the names and display records with the transparency first.
+/// The first channel's ink at (0, 0), inked, and at (3, 0), bare.
+fn ink(d: &Document) -> (f32, f32) {
+    (d.channels[0].surface.pixel(0, 0)[0], d.channels[0].surface.pixel(3, 0)[0])
+}
+
+/// `doc` laid out as Photoshop 25.12 saves a TIFF with Save Transparency on: R, G, B,
+/// transparency and spot samples, with "Transparency" first in the channel names and display
+/// records. With `layers`, the layer data has a positive layer count and an `MTrn` block (the
+/// specification's key is `Mtrn`); without, the file is flat. Built from the PSD model of `doc`.
+fn photoshop_transparency_and_spot_tiff(doc: &Document, layers: bool) -> Vec<u8> {
+    use photocraft_psd::{Compression, TaggedBlock};
+
     let opts = PsdExportOptions { merged_matte: false, merged_compression: Compression::Raw, ..Default::default() };
-    let (file, _) = document_to_psd_with(&doc, &opts);
+    let (file, _) = document_to_psd_with(doc, &opts);
     let planes = file.decode_merged().unwrap();
     let n = 16;
     assert_eq!(planes.len(), 5 * n);
@@ -628,15 +633,26 @@ fn photoshop_mtrn_tiff_opens_without_a_transparency_channel() {
     let mut img = photocraft_codecs::Image::from_raw(4, 4, photocraft_codecs::ChannelLayout::Rgba, photocraft_codecs::SampleType::U8, rgba).unwrap();
     img.meta.extra_samples = vec![photocraft_codecs::ExtraSample { kind: 0, data: planes[4 * n..].to_vec() }];
     img.meta.photoshop_resources = Some(photocraft_psd::tiff::resources_to_bytes(&file.resources).unwrap());
-    let mut isd = ImageSourceData::from_psd(&file);
-    if let Some(info) = &mut isd.layer_info {
-        info.merged_alpha = false;
+    if layers {
+        let mut isd = ImageSourceData::from_psd(&file);
+        if let Some(info) = &mut isd.layer_info {
+            info.merged_alpha = false;
+        }
+        isd.global_blocks.insert(0, TaggedBlock::new(*b"MTrn", Vec::new()));
+        let order = if photocraft_codecs::tiff_writes_little_endian() { ByteOrder::Little } else { ByteOrder::Big };
+        img.meta.photoshop_layers = Some(isd.to_bytes(order).unwrap().0);
     }
-    isd.global_blocks.insert(0, TaggedBlock::new(*b"MTrn", Vec::new()));
-    let order = if photocraft_codecs::tiff_writes_little_endian() { ByteOrder::Little } else { ByteOrder::Big };
-    img.meta.photoshop_layers = Some(isd.to_bytes(order).unwrap().0);
-    let bytes = photocraft_codecs::encode(&img, photocraft_codecs::Format::Tiff, &photocraft_codecs::EncodeOptions::default()).unwrap();
+    photocraft_codecs::encode(&img, photocraft_codecs::Format::Tiff, &photocraft_codecs::EncodeOptions::default()).unwrap()
+}
 
+/// Photoshop's layered TIFF with transparency next to a spot channel opens with the spot as the
+/// only channel. A layered re-save leaves the transparency sample out next to the spot, so it
+/// must also drop the `MTrn` marker, or the spot would read back as transparency.
+#[test]
+fn photoshop_mtrn_tiff_opens_without_a_transparency_channel() {
+    use photocraft_psd::TaggedBlock;
+
+    let bytes = photoshop_transparency_and_spot_tiff(&transparent_art_with_white_spot(), true);
     let opened = import("t.tif", &bytes).unwrap().document;
     let names: Vec<&str> = opened.channels.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["White"]);
@@ -650,6 +666,22 @@ fn photoshop_mtrn_tiff_opens_without_a_transparency_channel() {
     let names: Vec<&str> = back.channels.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["White"]);
     assert_eq!(ink(&back), (1.0, 0.0));
+}
+
+/// The same Photoshop layout in a flat TIFF (no layer data): the image keeps its transparency,
+/// and the spot gets its own name and display record, not the leading "Transparency" ones, so
+/// it opens as a spot with its ink the right way round.
+#[test]
+fn photoshop_flat_tiff_with_transparency_opens_its_spot_as_a_spot() {
+    let bytes = photoshop_transparency_and_spot_tiff(&transparent_art_with_white_spot(), false);
+    assert!(tags(&bytes).1.is_none(), "flat: no layer data");
+    let opened = import("t.tif", &bytes).unwrap().document;
+    let names: Vec<&str> = opened.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["White"]);
+    assert!(opened.channels[0].spot.is_some(), "a spot, not an alpha channel");
+    assert_eq!(ink(&opened), (1.0, 0.0));
+    let LayerContent::Raster(s) = &opened.layers[0].content else { panic!("raster") };
+    assert_eq!(s.pixel(0, 0)[3], 0.0, "the image keeps its transparency");
 }
 
 /// A Lab document with a spot channel keeps the spot as a CIELab extra sample, and its

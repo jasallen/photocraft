@@ -714,6 +714,12 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
         scratch_cap,
         extra_at,
     };
+    // Extra samples share the allocation budget with the image: their interleaved buffer and the
+    // planes split from it are held next to the image, so both count against `max_alloc`.
+    if !lay.extra_at.is_empty() {
+        let per_pixel = out_layout.channels().saturating_add(lay.extra_at.len().saturating_mul(2)).saturating_mul(out.bytes());
+        limits.check_bytes(w, h, per_pixel as u64)?;
+    }
 
     // The output, allocated once and fallibly.
     let out_row = lay.out_row();
@@ -735,7 +741,7 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
     let mut img = Image::from_raw(w, h, out_layout, out, data)?;
     if !lay.extra_at.is_empty() {
         let kind_of = |si: usize| si.checked_sub(color).and_then(|k| extra.get(k)).copied().unwrap_or(0) as u16;
-        img.meta.extra_samples = split_extra_samples(&extra_data, wu, hu, &lay.extra_at, out, kind_of);
+        img.meta.extra_samples = split_extra_samples(&extra_data, wu, hu, &lay.extra_at, out, kind_of)?;
     }
     if tally.missing > 0 {
         img.warnings.push(DecodeWarning::Truncated { format: F });
@@ -790,14 +796,22 @@ fn extra_sample_indices(spp: usize, color: usize, alpha_at: Option<usize>, has_a
     used.into_iter().enumerate().filter(|(_, on)| !*on).map(|(i, _)| i).take(crate::MAX_EXTRA_SAMPLES).collect()
 }
 
-/// Interleaved extra samples (`extra_at.len()` per pixel) → one plane per sample.
-fn split_extra_samples(buf: &[u8], w: usize, h: usize, at: &[usize], sample: SampleType, mut kind_of: impl FnMut(usize) -> u16) -> Vec<crate::ExtraSample> {
+/// Interleaved extra samples (`extra_at.len()` per pixel) → one plane per sample. Each plane is
+/// allocated fallibly (the caller has checked their total against the limits).
+fn split_extra_samples(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    at: &[usize],
+    sample: SampleType,
+    mut kind_of: impl FnMut(usize) -> u16,
+) -> Result<Vec<crate::ExtraSample>, CodecError> {
     let b = sample.bytes();
     let n = w.saturating_mul(h);
     let spp = at.len();
     let mut out = Vec::with_capacity(spp);
     for (ei, &si) in at.iter().enumerate() {
-        let mut data = vec![0u8; n.saturating_mul(b)];
+        let mut data = zeroed(n.saturating_mul(b))?;
         for i in 0..n {
             let src = (i.saturating_mul(spp).saturating_add(ei)).saturating_mul(b);
             let dst = i.saturating_mul(b);
@@ -807,7 +821,7 @@ fn split_extra_samples(buf: &[u8], w: usize, h: usize, at: &[usize], sample: Sam
         }
         out.push(crate::ExtraSample { kind: kind_of(si), data });
     }
-    out
+    Ok(out)
 }
 
 /// A zero-filled buffer, allocated fallibly. On native targets the zeroing (and the first

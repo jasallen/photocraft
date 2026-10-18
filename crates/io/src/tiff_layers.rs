@@ -794,12 +794,16 @@ pub(crate) fn channels_from_extras(doc: &mut Document, img: &Image) -> Vec<Strin
     let parsed = img.meta.photoshop_resources.as_deref().filter(|b| !b.is_empty()).and_then(|b| resources_from_bytes(b).ok());
     let none = Vec::new();
     let resources = parsed.as_ref().map(|(r, _)| r.as_slice()).unwrap_or(&none);
-    let names = resources.iter().find(|r| r.id == 1045).map(|r| crate::psd_import::unicode_names(&r.data)).unwrap_or_default();
+    let all_names = resources.iter().find(|r| r.id == 1045).map(|r| crate::psd_import::unicode_names(&r.data)).unwrap_or_default();
+    // As in the PSD importer: Photoshop lists the image transparency first ("Transparency", with
+    // its own display record), ahead of the channels the extra samples hold.
+    let skip = usize::from(img.layout().has_alpha() && all_names.len() == img.meta.extra_samples.len().saturating_add(1));
+    let names = all_names.get(skip..).unwrap_or_default();
     let kept = img.meta.extra_samples.len().min(codecs::MAX_EXTRA_SAMPLES);
     let spots = if let Some(r) = resources.iter().find(|r| r.id == crate::channel_map::DISPLAY_INFO) {
-        crate::channel_map::spot_flags(&r.data, true, kept)
+        crate::channel_map::spot_flags(&r.data, true, kept.saturating_add(skip)).split_off(skip)
     } else if let Some(r) = resources.iter().find(|r| r.id == crate::channel_map::DISPLAY_INFO_OLD) {
-        crate::channel_map::spot_flags(&r.data, false, kept)
+        crate::channel_map::spot_flags(&r.data, false, kept.saturating_add(skip)).split_off(skip)
     } else {
         vec![false; kept]
     };
@@ -821,9 +825,9 @@ pub(crate) fn channels_from_extras(doc: &mut Document, img: &Image) -> Vec<Strin
     {
         let slice = &mut doc.channels[start..];
         if let Some(r) = resources.iter().find(|r| r.id == crate::channel_map::DISPLAY_INFO) {
-            crate::channel_map::apply_display_info(&r.data, true, 0, slice);
+            crate::channel_map::apply_display_info(&r.data, true, skip, slice);
         } else if let Some(r) = resources.iter().find(|r| r.id == crate::channel_map::DISPLAY_INFO_OLD) {
-            crate::channel_map::apply_display_info(&r.data, false, 0, slice);
+            crate::channel_map::apply_display_info(&r.data, false, skip, slice);
         }
     }
     let first = img.layout().color_channels().saturating_add(usize::from(img.layout().has_alpha()));
