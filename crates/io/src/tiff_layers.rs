@@ -228,58 +228,39 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
     // channels, matted on white, and each layer keeps its own transparency. With no user
     // channel the composite stays unmatted, straight RGBA, which is what a plain transparent
     // TIFF already round-trips as.
+    // Layer data is written PSD-style ("Adobe Photoshop Document Data Block", 4-byte lengths), as
+    // Photoshop writes it: Photoshop does not read the PSB-style header ("... Data V0002") in a
+    // TIFF and opens only the composite, as one locked Background. The exporter's size estimate
+    // counts layer planes uncompressed, so a document with many canvas-sized layers passes 2 GB
+    // while its real layer data is a small fraction of that; it is not used here. PSB-style data
+    // is written only past 30000 px, when asked for, or when a length really overflows 32 bits.
     let user_channels = !doc.channels.is_empty() || doc.quick_mask.is_some();
+    let force_psb = opts.force_psb || big;
     let psd_opts = PsdExportOptions {
-        force_psb: opts.force_psb || big,
+        force_psb,
+        size_limit_psb: false,
         merged_matte: user_channels,
         merged_compression: Compression::Raw,
         maximize_compatibility: true,
         document_path: opts.document_path.clone(),
     };
-    let (file, w) = crate::with_span(ctl, 0.0, TIFF_MODEL_DONE, |ctl| crate::psd_export::document_to_psd_interruptible(doc, &psd_opts, ctl));
+    let (mut file, w) = crate::with_span(ctl, 0.0, TIFF_MODEL_DONE, |ctl| crate::psd_export::document_to_psd_interruptible(doc, &psd_opts, ctl));
     // A cancelled conversion stops early with an incomplete model: never encode it.
     ctl.check().map_err(|_| IoError::Cancelled)?;
     warnings.extend(w);
     let order = if codecs::tiff_writes_little_endian() { ByteOrder::Little } else { ByteOrder::Big };
-    // Photoshop pairs alpha-name resources with samples past the colour channels and ignores
-    // the ExtraSamples kind. The merged transparency must not occupy that first slot when a
-    // spot is also stored. Layer transparency stays in each layer's channel −1.
-    let mut isd = ImageSourceData::from_psd(&file);
-    let spot_extras = file.header.channels as usize > {
-        let cc = doc.pixel_format().mode.color_channels();
-        let alpha = file.layer_info.as_ref().is_some_and(|l| l.merged_alpha);
-        cc + usize::from(alpha)
-    };
-    // Positive layer count: the merged image's first extra sample is not transparency
-    // (Photoshop's own spot TIFF does this; a negative count would claim the spot plane is alpha).
-    if spot_extras && let Some(info) = &mut isd.layer_info {
-        info.merged_alpha = false;
-    }
-    // A merged-transparency marker kept from an opened file (Photoshop's `MTrn`) would make the
-    // first spot read back as transparency: keep it only while the composite keeps that sample.
-    if spot_extras || !file.layer_info.as_ref().is_some_and(|l| l.merged_alpha) {
-        isd.global_blocks.retain(|b| !b.is_merged_transparency_marker());
-    }
-    if let Some(info) = &mut isd.layer_info {
-        for layer in &mut info.layers {
-            photoshop_layer_blocks(&mut layer.blocks);
+    let (layers, w) = match tiff_image_source(doc, &file).to_bytes(order) {
+        Err(photocraft_psd::PsdError::LimitExceeded(_)) if !force_psb => {
+            let psb_opts = PsdExportOptions { force_psb: true, ..psd_opts };
+            let (psb, w) = crate::with_span(ctl, 0.0, TIFF_MODEL_DONE, |ctl| crate::psd_export::document_to_psd_interruptible(doc, &psb_opts, ctl));
+            ctl.check().map_err(|_| IoError::Cancelled)?;
+            warnings.extend(w);
+            warnings.push("layer data exceeds 4 GB; written with PSB-sized lengths, which some readers do not open".into());
+            file = psb;
+            tiff_image_source(doc, &file).to_bytes(order)?
         }
-    }
-    // Photoshop reads a fixed 14-byte user-mask record from `LMsk` and an empty `Patt`
-    // before the filter mask. A zero-length `LMsk` is what makes it report that the
-    // layer data could not be read.
-    if let Some(mask) = &mut isd.global_layer_mask
-        && mask.data.len() < 14
-    {
-        *mask = photocraft_psd::GlobalLayerMask::photoshop_default();
-    }
-    if !isd.global_blocks.iter().any(|b| matches!(&b.key, b"Patt" | b"Pat2" | b"Pat3")) {
-        isd.global_blocks.insert(0, photocraft_psd::TaggedBlock::new(*b"Patt", Vec::new()));
-    }
-    if !isd.global_blocks.iter().any(|b| &b.key == b"FMsk") {
-        isd.global_blocks.push(photocraft_psd::TaggedBlock::new(*b"FMsk", FILTER_MASK_DEFAULT.to_vec()));
-    }
-    let (layers, w) = isd.to_bytes(order)?;
+        r => r?,
+    };
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(TIFF_LAYERS_DONE);
     warnings.extend(w.into_iter().map(|w| format!("layer data: {w}")));
@@ -354,6 +335,50 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
         ..Default::default()
     };
     encode_image(&img, Format::Tiff, opts, warnings)
+}
+
+/// The layer data (`ImageSourceData`) of a layered TIFF saved from `file`, adjusted the way
+/// Photoshop writes it.
+fn tiff_image_source(doc: &Document, file: &photocraft_psd::PsdFile) -> ImageSourceData {
+    // Photoshop pairs alpha-name resources with samples past the colour channels and ignores
+    // the ExtraSamples kind. The merged transparency must not occupy that first slot when a
+    // spot is also stored. Layer transparency stays in each layer's channel −1.
+    let mut isd = ImageSourceData::from_psd(file);
+    let spot_extras = file.header.channels as usize > {
+        let cc = doc.pixel_format().mode.color_channels();
+        let alpha = file.layer_info.as_ref().is_some_and(|l| l.merged_alpha);
+        cc + usize::from(alpha)
+    };
+    // Positive layer count: the merged image's first extra sample is not transparency
+    // (Photoshop's own spot TIFF does this; a negative count would claim the spot plane is alpha).
+    if spot_extras && let Some(info) = &mut isd.layer_info {
+        info.merged_alpha = false;
+    }
+    // A merged-transparency marker kept from an opened file (Photoshop's `MTrn`) would make the
+    // first spot read back as transparency: keep it only while the composite keeps that sample.
+    if spot_extras || !file.layer_info.as_ref().is_some_and(|l| l.merged_alpha) {
+        isd.global_blocks.retain(|b| !b.is_merged_transparency_marker());
+    }
+    if let Some(info) = &mut isd.layer_info {
+        for layer in &mut info.layers {
+            photoshop_layer_blocks(&mut layer.blocks);
+        }
+    }
+    // Photoshop reads a fixed 14-byte user-mask record from `LMsk` and an empty `Patt`
+    // before the filter mask. A zero-length `LMsk` is what makes it report that the
+    // layer data could not be read.
+    if let Some(mask) = &mut isd.global_layer_mask
+        && mask.data.len() < 14
+    {
+        *mask = photocraft_psd::GlobalLayerMask::photoshop_default();
+    }
+    if !isd.global_blocks.iter().any(|b| matches!(&b.key, b"Patt" | b"Pat2" | b"Pat3")) {
+        isd.global_blocks.insert(0, photocraft_psd::TaggedBlock::new(*b"Patt", Vec::new()));
+    }
+    if !isd.global_blocks.iter().any(|b| &b.key == b"FMsk") {
+        isd.global_blocks.push(photocraft_psd::TaggedBlock::new(*b"FMsk", FILTER_MASK_DEFAULT.to_vec()));
+    }
+    isd
 }
 
 /// Removes the leading transparency entry from the channel-name resources (1006, 1045) and
@@ -875,4 +900,55 @@ fn mask_from_plane(data: &[u8], w: u32, h: u32, n: usize, from: CSample, depth: 
     s.write_interleaved(rect, &bytes);
     s.prune();
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use photocraft_doc::{Color, Document, Fill, FillCache, Layer, LayerContent};
+    use photocraft_raster::Surface;
+
+    use crate::{ExportOptions, export};
+
+    /// Hidden solid fills on a 2048² canvas: the PSD size estimate counts each one as a
+    /// canvas-sized plane (16 MiB at 8 bits), so 140 of them pass 2 GB, while their real pixels
+    /// (the cached rendering, pruned to nothing) take almost no space. A layered TIFF of such a
+    /// document must still carry PSD-style layer data: Photoshop does not read the PSB-style
+    /// header in a TIFF and opens only the composite, as one locked Background.
+    fn many_cheap_fills() -> Document {
+        let mut doc = Document::new("many fills", photocraft_geom::Size::new(2048, 2048), photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8);
+        for i in 0..140 {
+            let fill = Fill::Solid(Color::rgb(0.5, 0.25, 0.75));
+            let mut l = Layer::new(format!("Fill {i}"), LayerContent::Fill(fill.clone()));
+            l.visible = false;
+            l.fill_cache = Some(FillCache { fill, surface: Surface::new(doc.pixel_format()) });
+            doc.layers.push(l);
+        }
+        doc
+    }
+
+    #[test]
+    fn layered_tiff_ignores_the_uncompressed_size_estimate() {
+        let doc = many_cheap_fills();
+        assert!(crate::psd_export::psd_size_exceeds_limit(&doc), "the fixture must pass the 2 GB estimate");
+
+        let r = export(&doc, "x.tif", &ExportOptions { tiff_layers: true, ..Default::default() }).unwrap();
+        let (_, layers) = photocraft_codecs::tiff_photoshop_tags(&r.bytes);
+        let layers = layers.unwrap();
+        assert!(layers.starts_with(photocraft_psd::tiff::SIGNATURE), "{:?}", String::from_utf8_lossy(&layers[..36.min(layers.len())]));
+        assert!(!r.warnings.iter().any(|w| w.contains("PSB")), "{:?}", r.warnings);
+        let back = crate::import("x.tif", &r.bytes).unwrap().document;
+        assert_eq!(back.layers.len(), doc.layers.len());
+
+        // A .psd save still switches to PSB on the estimate, as before.
+        let psd = export(&doc, "x.psd", &ExportOptions::default()).unwrap();
+        assert_eq!(psd.bytes.get(4..6), Some(&[0u8, 2][..]), "PSD saves keep the size-estimate switch");
+    }
+
+    #[test]
+    fn forcing_psb_still_writes_psb_style_layer_data() {
+        let doc = many_cheap_fills();
+        let r = export(&doc, "x.tif", &ExportOptions { tiff_layers: true, force_psb: true, ..Default::default() }).unwrap();
+        let (_, layers) = photocraft_codecs::tiff_photoshop_tags(&r.bytes);
+        assert!(layers.unwrap().starts_with(photocraft_psd::tiff::SIGNATURE_PSB));
+    }
 }
